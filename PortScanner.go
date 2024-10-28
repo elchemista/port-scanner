@@ -1,214 +1,204 @@
-/***
- * Simple port scanner
- *
- *
- */
-
 package portscanner
 
 import (
-	"net"
-	//	"os"
 	"fmt"
-	//	"io/ioutil"
-	//	"strings"
-	"time"
+	"net"
 	"sync"
+	"time"
 
-	"github.com/anvie/port-scanner/predictors"
-	"github.com/anvie/port-scanner/predictors/webserver"
+	"github.com/elchemista/port-scanner/predictors"
+	"github.com/elchemista/port-scanner/predictors/webserver"
 )
 
+const UNKNOWN = "<unknown>"
+
 type PortScanner struct {
-	host       string
-	predictors []predictors.Predictor
-	timeout    time.Duration
-	threads    int
+	host         string
+	predictors   []predictors.Predictor
+	timeout      time.Duration
+	threads      int
 	usePredictor bool
 }
 
 func NewPortScanner(host string, timeout time.Duration, threads int) *PortScanner {
-	return &PortScanner{host, []predictors.Predictor{
-		&webserver.ApachePredictor{},
-		&webserver.NginxPredictor{},
-	}, timeout, threads, true,
+	return &PortScanner{
+		host:         host,
+		predictors:   []predictors.Predictor{&webserver.ApachePredictor{}, &webserver.NginxPredictor{}},
+		timeout:      timeout,
+		threads:      threads,
+		usePredictor: true,
 	}
 }
-func (h *PortScanner) TogglePredictor(usePredictor bool) {
-	h.usePredictor = usePredictor
+
+func (ps *PortScanner) TogglePredictor(usePredictor bool) {
+	ps.usePredictor = usePredictor
 }
-func (h *PortScanner) SetThreads(threads int) {
-	h.threads = threads
+
+func (ps *PortScanner) SetThreads(threads int) {
+	ps.threads = threads
 }
-func (h *PortScanner) SetTimeout(timeout time.Duration) {
-	h.timeout = timeout
+
+func (ps *PortScanner) SetTimeout(timeout time.Duration) {
+	ps.timeout = timeout
 }
-func (h *PortScanner) RegisterPredictor(predictor predictors.Predictor) {
-	for _, p := range h.predictors {
+
+func (ps *PortScanner) RegisterPredictor(predictor predictors.Predictor) {
+	for _, p := range ps.predictors {
 		if p == predictor {
 			return
 		}
 	}
-	h.predictors = append(h.predictors, predictor)
+	ps.predictors = append(ps.predictors, predictor)
 }
 
-func (h PortScanner) IsOpen(port int) bool {
-	tcpAddr, err := net.ResolveTCPAddr("tcp4", h.hostPort(port))
+func (ps PortScanner) IsOpen(port int) bool {
+	address := ps.hostPort(port)
+	conn, err := net.DialTimeout("tcp", address, ps.timeout)
 	if err != nil {
 		return false
 	}
-	conn, err := net.DialTimeout("tcp", tcpAddr.String(), h.timeout)
-	if err != nil {
-		return false
-	}
-
-	defer conn.Close()
-
+	conn.Close()
 	return true
 }
 
-func (h PortScanner) GetOpenedPort(portStart int, portEnds int) []int {
-	rv := []int{}
-	l := sync.Mutex{}
-	sem := make(chan bool, h.threads)
-	for port := portStart; port <= portEnds; port++ {
-		sem <- true
+func (ps PortScanner) GetOpenedPorts(start, end int) []int {
+	var openPorts []int
+	var mu sync.Mutex
+	wg := sync.WaitGroup{}
+	sem := make(chan struct{}, ps.threads)
+
+	for port := start; port <= end; port++ {
+		sem <- struct{}{}
+		wg.Add(1)
 		go func(port int) {
-			if h.IsOpen(port) {
-				l.Lock()
-				rv = append(rv, port)
-				l.Unlock()
+			defer wg.Done()
+			if ps.IsOpen(port) {
+				mu.Lock()
+				openPorts = append(openPorts, port)
+				mu.Unlock()
 			}
-			<- sem
+			<-sem
 		}(port)
 	}
-	for i := 0; i < cap(sem); i++ {
-		sem <- true
-	}
-	return rv
+
+	wg.Wait()
+	return openPorts
 }
 
-func (h PortScanner) hostPort(port int) string {
-	return fmt.Sprintf("%s:%d", h.host, port)
+func (ps PortScanner) hostPort(port int) string {
+	return fmt.Sprintf("%s:%d", ps.host, port)
 }
 
-const UNKNOWN = "<unknown>"
-
-func (h PortScanner) openConn(host string) (net.Conn, error) {
-	tcpAddr, err := net.ResolveTCPAddr("tcp4", host)
-	if err != nil {
-		return nil, err
+func (ps PortScanner) DescribePort(port int) string {
+	if !ps.usePredictor {
+		return ps.predictPort(port)
 	}
 
-	conn, err := net.DialTimeout("tcp", tcpAddr.String(), h.timeout)
-	if err != nil {
-		return nil, err
-	}
-
-	return conn, nil
-}
-
-func (h PortScanner) DescribePort(port int) string {
-	if !h.usePredictor {
-		return h.predictPort(port)
-	}
-
-	switch {
-	default:
-		return UNKNOWN
-	case h.IsHttp(port):
-		rv := h.PredictUsingPredictor(h.hostPort(port))
-		return rv
-	case port > 0:
-		assumed := h.predictPort(port)
-		rv := assumed
+	description := UNKNOWN
+	if ps.IsHttp(port) {
+		description = ps.PredictUsingPredictor(ps.hostPort(port))
+	} else {
+		assumed := ps.predictPort(port)
+		description = assumed
 		if assumed == UNKNOWN {
-			rv = h.PredictUsingPredictor(h.hostPort(port))
+			description = ps.PredictUsingPredictor(ps.hostPort(port))
 		}
-
-		switch assumed {
-		case "MySQL":
-			// get the version
-			conn, err := h.openConn(h.hostPort(port))
-			if err == nil {
-				defer conn.Close()
-
-				duration, _ := time.ParseDuration("3s")
-
-				conn.SetDeadline(time.Now().Add(duration))
-
-				conn.Read(make([]byte, 5))
-				result := make([]byte, 20)
-
-				_, err := conn.Read(result)
-				if err != nil {
-					fmt.Printf("error: %v\n", err)
-					return ""
-				}
-
-				resp := string(result)
-				rv = assumed + " version: " + resp
-			}
+		if assumed == "MySQL" {
+			description = ps.getMySQLVersion(port, assumed)
 		}
-
-		return rv
 	}
+
+	return description
 }
 
-func (h PortScanner) IsHttp(port int) bool {
+func (ps PortScanner) IsHttp(port int) bool {
 	return port == 80 || port == 8080
 }
 
-func (h PortScanner) PredictUsingPredictor(host string) string {
-	for _, p := range h.predictors {
-		conn, err := h.openConn(host)
+func (ps PortScanner) PredictUsingPredictor(host string) string {
+	for _, predictor := range ps.predictors {
+		conn, err := ps.openConn(host)
 		if err != nil {
-			break
+			continue
 		}
 		defer conn.Close()
-		rv := p.Predict(host)
-		if len(rv) > 0 {
-			return rv
+		if result := predictor.Predict(host); len(result) > 0 {
+			return result
 		}
 	}
 	return UNKNOWN
 }
 
-var KNOWN_PORTS = map[int]string{
-	27017: "mongodb [ http://www.mongodb.org/ ]",
-	28017: "mongodb web admin [ http://www.mongodb.org/ ]",
-	21:    "ftp",
-	22:    "SSH",
-	23:    "telnet",
-	25:    "SMTP",
-	66:    "Oracle SQL*NET?",
-	69:    "tftp",
-	80:    "http",
-	88:    "kerberos",
-	109:   "pop2",
-	110:   "pop3",
-	123:   "ntp",
-	137:   "netbios",
-	139:   "netbios",
-	443:   "https",
-	445:   "Samba",
-	631:   "cups",
-	5800:  "VNC remote desktop",
-	194:   "IRC",
-	118:   "SQL service?",
-	150:   "SQL-net?",
-	1433:  "Microsoft SQL server",
-	1434:  "Microsoft SQL monitor",
-	3306:  "MySQL",
-	3396:  "Novell NDPS Printer Agent",
-	3535:  "SMTP (alternate)",
-	554:   "RTSP",
-	9160:  "Cassandra [ http://cassandra.apache.org/ ]",
+func (ps PortScanner) openConn(host string) (net.Conn, error) {
+	tcpAddr, err := net.ResolveTCPAddr("tcp4", host)
+	if err != nil {
+		return nil, err
+	}
+	return net.DialTimeout("tcp", tcpAddr.String(), ps.timeout)
 }
 
-func (h PortScanner) predictPort(port int) string {
-	if rv, ok := KNOWN_PORTS[port]; ok {
-		return rv
+func (ps PortScanner) getMySQLVersion(port int, assumed string) string {
+	conn, err := ps.openConn(ps.hostPort(port))
+	if err != nil {
+		return assumed
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	result := make([]byte, 20)
+	if _, err := conn.Read(result); err == nil {
+		return assumed + " version: " + string(result)
+	}
+	return assumed
+}
+
+var KNOWN_PORTS = map[int]string{
+	21:    "FTP",
+	22:    "SSH",
+	23:    "Telnet",
+	25:    "SMTP",
+	53:    "DNS",
+	66:    "Oracle SQL*NET?",
+	69:    "TFTP",
+	80:    "HTTP",
+	88:    "Kerberos",
+	109:   "POP2",
+	110:   "POP3",
+	118:   "SQL Service?",
+	123:   "NTP",
+	137:   "NetBIOS",
+	139:   "NetBIOS",
+	143:   "IMAP",
+	150:   "SQL-Net?",
+	194:   "IRC",
+	443:   "HTTPS",
+	445:   "Samba",
+	465:   "SMTP over SSL",
+	554:   "RTSP",
+	5800:  "VNC Remote Desktop",
+	631:   "CUPS",
+	993:   "IMAP over SSL",
+	995:   "POP3 over SSL",
+	1433:  "Microsoft SQL Server",
+	1434:  "Microsoft SQL Monitor",
+	3306:  "MySQL",
+	3389:  "Remote Desktop Protocol (RDP)",
+	3396:  "Novell NDPS Printer Agent",
+	3535:  "SMTP (Alternate)",
+	5432:  "PostgreSQL",
+	6379:  "Redis",
+	8080:  "HTTP Alternate",
+	9160:  "Cassandra",
+	9200:  "Elasticsearch",
+	11211: "Memcached",
+	27017: "MongoDB",
+	28017: "MongoDB Web Admin",
+}
+
+func (ps PortScanner) predictPort(port int) string {
+	if desc, exists := KNOWN_PORTS[port]; exists {
+		return desc
 	}
 	return UNKNOWN
 }

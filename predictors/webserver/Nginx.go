@@ -1,24 +1,24 @@
 package webserver
 
 import (
+	"io"
 	"net"
-	"io/ioutil"
 	"strings"
 	"time"
-	"github.com/anvie/port-scanner/predictors"
-//	"fmt"
+
+	"github.com/elchemista/port-scanner/predictors"
+	// "fmt"
 )
 
 type NginxPredictor struct {
 	predictors.BaseHttpPredictor
 }
 
-
 func (p *NginxPredictor) Predict(host string) string {
 	duration, _ := time.ParseDuration("3s")
 
 	tcpAddr, err := net.ResolveTCPAddr("tcp4", host)
-	if (err != nil) {
+	if err != nil {
 		return ""
 	}
 
@@ -34,7 +34,7 @@ func (p *NginxPredictor) Predict(host string) string {
 		return ""
 	}
 
-	result, err := ioutil.ReadAll(conn)
+	result, err := io.ReadAll(conn)
 	if err != nil {
 		return ""
 	}
@@ -49,5 +49,3 @@ func (p *NginxPredictor) PredictResponseDetail(resp string) string {
 	}
 	return ""
 }
-
-
